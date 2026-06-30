@@ -1,0 +1,30 @@
+{
+  "name": "mytan",
+  "version": "0.0.1",
+  "private": true,
+  "description": "App che aiuta ad abbronzarsi in sicurezza in base a fototipo e dati UV reali",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "verify:meteo": "tsx src/scripts/verifyMeteo.ts",
+    "demo:plan": "tsx src/scripts/demoPlan.ts",
+    "demo:progress": "tsx src/scripts/demoProgress.ts",
+    "demo:journey": "tsx src/scripts/demoJourney.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vite": "^8.1.2"
+  },
+  "dependencies": {
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  }
+}
