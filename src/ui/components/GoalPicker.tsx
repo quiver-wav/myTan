@@ -23,7 +23,7 @@ export function GoalPicker() {
           disabled={!reachable}
           onClick={() => update({ goalId: goal.id })}
         >
-          {goal.label} {!reachable && "🚫"}
+          {goal.label}
           <span className="desc">{goal.description}</span>
         </button>
       ))}

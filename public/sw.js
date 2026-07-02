@@ -7,7 +7,7 @@
 //
 // La prima apertura deve avvenire ONLINE per popolare la cache.
 
-const VERSION = "mytan-v1";
+const VERSION = "mytan-v2";
 const SHELL = `${VERSION}-shell`;
 const API = `${VERSION}-api`;
 const API_HOSTS = ["api.open-meteo.com", "geocoding-api.open-meteo.com"];
@@ -53,13 +53,21 @@ self.addEventListener("fetch", (event) => {
   // Solo same-origin per il resto
   if (url.origin !== self.location.origin) return;
 
-  // Navigazioni: network-first, fallback alla index in cache (app shell)
+  // Navigazioni: network-first, fallback alla index in cache (app shell).
+  // A ogni navigazione riuscita la copia offline della index viene aggiornata,
+  // così l'app offline non resta indietro di versione.
   if (request.mode === "navigate") {
     const indexUrl = new URL("./index.html", self.registration.scope).toString();
     event.respondWith(
-      fetch(request).catch(() =>
-        caches.match(indexUrl).then((r) => r || caches.match(self.registration.scope)),
-      ),
+      fetch(request)
+        .then((res) => {
+          const copy = res.clone();
+          caches.open(SHELL).then((c) => c.put(indexUrl, copy));
+          return res;
+        })
+        .catch(() =>
+          caches.match(indexUrl).then((r) => r || caches.match(self.registration.scope)),
+        ),
     );
     return;
   }

@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
+    "deploy": "npm run build && npx gh-pages -d dist",
     "verify:meteo": "tsx src/scripts/verifyMeteo.ts",
     "demo:plan": "tsx src/scripts/demoPlan.ts",
     "demo:progress": "tsx src/scripts/demoProgress.ts",
@@ -19,6 +20,7 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
+    "gh-pages": "^6.3.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vite": "^8.1.2"

@@ -16,12 +16,13 @@ interface Props {
   future: Point[];
 }
 
+// Variabili CSS del design system: il grafico segue tema chiaro/scuro da solo.
 const COL = {
-  sun: "#f5a623",
-  sunDark: "#e08600",
-  ink: "#3a2e1f",
-  line: "#f0e4d2",
-  muted: "#8a7a63",
+  sun: "var(--sun)",
+  sunDark: "var(--sun-deep)",
+  ink: "var(--ink)",
+  line: "var(--line)",
+  muted: "var(--muted)",
 };
 
 const W = 320;

@@ -30,6 +30,14 @@ export const TAN_CEILING_BY_PHOTOTYPE: Record<Phototype, number> = {
 /** Quanto rapidamente una sessione fa guadagnare colore (parametro calibrabile). */
 const GAIN_K = 0.3;
 
+/**
+ * Resa di una sessione che raggiunge la scottatura (dose ≥ 1 MED): la pelle
+ * danneggiata si abbronza PEGGIO, quindi sforare la soglia non solo non rende
+ * di più, ma dimezza il guadagno. Senza questa penalità il modello premierebbe
+ * chi si scotta — il contrario della fisiologia e del messaggio dell'app.
+ */
+const BURN_PENALTY = 0.5;
+
 /** Emivita dell'abbronzatura in giorni (ricambio cellulare cutaneo). */
 const HALF_LIFE_DAYS = 28;
 const DAILY_DECAY = Math.pow(0.5, 1 / HALF_LIFE_DAYS);
@@ -42,34 +50,43 @@ export function tanCeiling(phototype: Phototype): number {
 /**
  * Livello di abbronzatura obiettivo, sulla stessa scala 0..1.
  * Gli obiettivi sono espressi come frazione del tetto del fototipo:
- * dorato = metà del proprio massimo, ambrato = ~80%, scuro = il massimo.
+ * dorato = metà del proprio massimo, ambrato = ~75%, scuro = 90% (il 100%
+ * assoluto è un asintoto irraggiungibile a causa del decadimento).
+ * "Mantenimento" fa eccezione: l'obiettivo è il livello che GIÀ possiedi.
  */
-export function goalTargetTan(phototype: Phototype, goalId: TanningGoalId): number {
+export function goalTargetTan(
+  phototype: Phototype,
+  goalId: TanningGoalId,
+  startTan = 0,
+): number {
   const ceiling = tanCeiling(phototype);
-  // "scuro" punta al 90% del tetto (massimo pratico): il 100% assoluto è un
-  // asintoto irraggiungibile a causa del decadimento.
+  if (goalId === "mantenimento") return Math.min(startTan, ceiling);
   const fractionByGoal: Record<TanningGoalId, number> = {
     protezione: 0,
     dorato: 0.5,
     ambrato: 0.75,
     scuro: 0.9,
-    mantenimento: 0.75,
+    mantenimento: 0,
   };
   return ceiling * fractionByGoal[goalId];
 }
 
 /**
  * Applica una sessione: crescita a saturazione verso il tetto.
- * `doseFraction` è la dose ricevuta dalla pelle come frazione della MED
- * (tipicamente la `sessionFraction` dell'obiettivo).
+ * `doseFraction` è la dose ricevuta dalla pelle come frazione della MED.
+ * Il guadagno cresce solo fino alla soglia di scottatura (1 MED): la dose
+ * oltre quel punto non abbronza di più, e una sessione che scotta rende
+ * la metà (vedi BURN_PENALTY).
  */
 export function applySession(
   currentTan: number,
   doseFraction: number,
   ceiling: number,
 ): number {
-  const gain = GAIN_K * doseFraction * (ceiling - currentTan);
-  return Math.min(ceiling, currentTan + Math.max(0, gain));
+  const effective = Math.min(Math.max(0, doseFraction), 1);
+  let gain = GAIN_K * effective * (ceiling - currentTan);
+  if (doseFraction >= 1) gain *= BURN_PENALTY;
+  return Math.min(ceiling, currentTan + gain);
 }
 
 /** Applica il decadimento naturale su un numero di giorni. */
@@ -98,12 +115,19 @@ export interface GoalProjection {
 export interface ProjectionOptions {
   /** quante sessioni a settimana l'utente prevede di fare (default 4). */
   sessionsPerWeek?: number;
-  /** dose per sessione come frazione della MED; default = quella dell'obiettivo. */
+  /** dose per sessione come frazione della MED; default = frazione di sicurezza. */
   sessionDoseFraction?: number;
   /** livello di abbronzatura di partenza (default 0). */
   startTan?: number;
   /** orizzonte massimo di simulazione in giorni (default 90). */
   maxDays?: number;
+  /**
+   * Dose realmente ottenibile nei prossimi giorni secondo il meteo (indice =
+   * giorni da oggi, dal piano settimanale): `null` = giornata non utile (UV
+   * troppo basso o finestra passata). Oltre l'array si torna alla dose media.
+   * Rende la proiezione coerente con il forecast reale.
+   */
+  upcomingDoses?: (number | null)[];
 }
 
 /**
@@ -116,7 +140,7 @@ export function projectToGoal(
   options: ProjectionOptions = {},
 ): GoalProjection {
   const ceiling = tanCeiling(phototype);
-  const targetTan = goalTargetTan(phototype, goalId);
+  const targetTan = goalTargetTan(phototype, goalId, options.startTan ?? 0);
   const sessionsPerWeek = options.sessionsPerWeek ?? 4;
   const doseFraction = options.sessionDoseFraction ?? DEFAULT_SESSION_FRACTION;
   const maxDays = options.maxDays ?? 90;
@@ -133,9 +157,18 @@ export function projectToGoal(
   const reachThreshold = targetTan * 0.98;
 
   for (let day = 0; day < maxDays; day++) {
-    const exposed = exposureDays.includes(day % 7) && tan < ceiling;
+    // Nei giorni coperti dal forecast la sessione avviene solo se il meteo la
+    // permette, con la dose davvero ottenibile quel giorno.
+    let dose = doseFraction;
+    let weatherAllows = true;
+    if (options.upcomingDoses && day < options.upcomingDoses.length) {
+      const d = options.upcomingDoses[day];
+      if (d == null) weatherAllows = false;
+      else dose = d;
+    }
+    const exposed = exposureDays.includes(day % 7) && weatherAllows && tan < ceiling;
     if (exposed) {
-      tan = applySession(tan, doseFraction, ceiling);
+      tan = applySession(tan, dose, ceiling);
       sessionsNeeded++;
     }
     tan = applyDecay(tan, 1);
@@ -162,6 +195,10 @@ export interface LoggedSession {
   date: string;
   /** dose ricevuta dalla pelle come frazione della MED (da `computeSessionDose`). */
   skinDoseFraction: number;
+  /** dettagli opzionali, mostrati nello storico. */
+  startTime?: string;
+  durationMin?: number;
+  withSunscreen?: boolean;
 }
 
 /**
@@ -216,19 +253,24 @@ export interface RemainingProjection extends GoalProjection {
 
 /**
  * Ristima quanto manca all'obiettivo a partire dalle sessioni già svolte.
- * Le sessioni future sono assunte alla durata suggerita (frazione di sicurezza).
- * Se l'utente ha fatto sessioni più brevi, `currentTan` sarà più basso e
- * serviranno più giorni; se più lunghe, di meno.
+ * Le sessioni future sono assunte alla durata suggerita (frazione di sicurezza)
+ * o, nei giorni coperti dal forecast, alla dose che il meteo permette davvero.
+ * Passando `today`, l'abbronzatura viene fatta decadere dall'ultima sessione
+ * ad oggi: riaprire l'app dopo settimane mostra il livello sbiadito reale.
  */
 export function projectRemaining(
   phototype: Phototype,
   goalId: TanningGoalId,
   history: LoggedSession[],
-  options: ProjectionOptions & { decayDaysSinceLast?: number } = {},
+  options: ProjectionOptions & { today?: string } = {},
 ): RemainingProjection {
   let currentTan = tanFromHistory(phototype, history, { startTan: options.startTan });
-  if (options.decayDaysSinceLast && options.decayDaysSinceLast > 0) {
-    currentTan = applyDecay(currentTan, options.decayDaysSinceLast);
+  if (options.today && history.length > 0) {
+    const lastDate = history
+      .map((s) => s.date)
+      .sort()
+      .at(-1)!;
+    currentTan = applyDecay(currentTan, daysBetween(lastDate, options.today));
   }
   const proj = projectToGoal(phototype, goalId, { ...options, startTan: currentTan });
   return { ...proj, currentTan: round3(currentTan) };

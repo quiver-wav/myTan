@@ -9,22 +9,45 @@ import type {
   LoggedSession,
 } from "../core/index";
 
+/** Sessione di esposizione in corso (timer live). */
+export interface ActiveSession {
+  /** data locale della località, "YYYY-MM-DD" */
+  date: string;
+  /** ora di inizio locale della località, "HH:MM" */
+  startTime: string;
+  /** epoch ms del dispositivo all'avvio (per il cronometro) */
+  startedAt: number;
+  withSunscreen: boolean;
+  /** epoch ms dell'inizio della pausa corrente ("bagno"), null se non in pausa */
+  pausedAt?: number | null;
+  /** minuti totali già trascorsi in pausa (esclusa la pausa corrente) */
+  pausedMin?: number;
+}
+
 export interface AppData {
   phototype: PhototypeResult | null;
+  /** l'utente ha visto e confermato il risultato del questionario */
+  phototypeConfirmed: boolean;
   location: GeoLocation | null;
+  /** località usate di recente, la più recente per prima (max 5) */
+  savedLocations: GeoLocation[];
   goalId: TanningGoalId | null;
   useSunscreen: boolean;
   sessionsPerWeek: number;
   history: LoggedSession[];
+  activeSession: ActiveSession | null;
 }
 
 const DEFAULT_DATA: AppData = {
   phototype: null,
+  phototypeConfirmed: false,
   location: null,
+  savedLocations: [],
   goalId: null,
   useSunscreen: false,
   sessionsPerWeek: 4,
   history: [],
+  activeSession: null,
 };
 
 const STORAGE_KEY = "mytan:data:v1";

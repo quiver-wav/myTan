@@ -7,3 +7,4 @@ export * from "./openMeteo";
 export * from "./phototype";
 export * from "./tanning";
 export * from "./tanProgress";
+export * from "./time";

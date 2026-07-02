@@ -1,10 +1,16 @@
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
 
 export default defineConfig({
-  // Percorsi relativi: l'app funziona sia in root sia in una sottocartella
-  // (es. GitHub Pages: tuonome.github.io/mytan/), senza sapere il nome del repo.
-  base: "./",
   plugins: [react()],
-  server: { port: 5173 },
-});
+  base: '/myTan/', // NOME DEL TUO REPOSITORY (con le barre)
+  build: {
+    outDir: 'dist',
+    assetsDir: 'assets',
+    rollupOptions: {
+      output: {
+        manualChunks: undefined,
+      },
+    },
+  },
+})

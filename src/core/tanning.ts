@@ -19,6 +19,7 @@
 
 import type { Forecast } from "./types";
 import type { Phototype } from "./phototype";
+import { hhmmToMinute, minuteToHHMM } from "./time";
 
 /** Dose Minima Eritemale per fototipo, in J/m² (≈ valori di letteratura). */
 export const MED_BY_PHOTOTYPE: Record<Phototype, number> = {
@@ -140,17 +141,12 @@ export function effectiveSpf(nominalSpf: number): number {
 }
 
 // --- Conversioni orarie -----------------------------------------------------
+// (hhmmToMinute e minuteToHHMM vivono in ./time e sono condivise con la UI)
 
 function minuteOfDay(isoTime: string): number {
   const hh = Number(isoTime.slice(11, 13));
   const mm = Number(isoTime.slice(14, 16));
   return hh * 60 + mm;
-}
-
-function minutesToHHMM(minute: number): string {
-  const hh = Math.floor(minute / 60);
-  const mm = Math.round(minute % 60);
-  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
 }
 
 // --- Profilo UV giornaliero -------------------------------------------------
@@ -253,6 +249,8 @@ export interface SessionPlan {
   peakUv: number;
   /** true se la sessione raggiunge la dose obiettivo entro il tramonto. */
   reachedTarget: boolean;
+  /** dose alla pelle come frazione della MED (0 nei giorni senza sessione). */
+  skinDoseFraction: number;
   withSunscreen: boolean;
   recommendedSpf: number;
   note?: string;
@@ -278,6 +276,12 @@ export interface PlanOptions {
   windowPreference?: "peak" | "gentle";
   /** UVI sotto cui non si pianifica esposizione (default 2). */
   minUsefulUv?: number;
+  /**
+   * Data e minuto correnti nel fuso della località (vedi `nowInTimezone`):
+   * per il giorno corrente la ricerca delle finestre parte da qui, così non
+   * vengono mai proposte fasce orarie già passate.
+   */
+  now?: { date: string; minute: number };
 }
 
 /**
@@ -338,6 +342,13 @@ export function buildWeeklyPlan(
     // ma con crema serve un fattore SPF in più di radiazione ambientale.
     const targetDose = sessionFraction * med * spfFactor;
 
+    // Per il giorno corrente le finestre partono da "adesso": mai proporre
+    // orari già passati.
+    const isToday = options.now?.date === profile.date;
+    const earliest = isToday
+      ? Math.max(profile.sunriseMin, options.now!.minute)
+      : profile.sunriseMin;
+
     if (profile.uvMax < minUsefulUv) {
       sessions.push({
         date: profile.date,
@@ -347,6 +358,7 @@ export function buildWeeklyPlan(
         avgUv: 0,
         peakUv: profile.uvMax,
         reachedTarget: false,
+        skinDoseFraction: 0,
         withSunscreen: options.useSunscreen,
         recommendedSpf: spf,
         note: "UV troppo basso: giornata poco utile per abbronzarsi.",
@@ -354,7 +366,7 @@ export function buildWeeklyPlan(
       continue;
     }
 
-    const best = pickBestWindow(profile, targetDose, windowPreference);
+    const best = pickBestWindow(profile, targetDose, windowPreference, earliest);
     if (!best) {
       sessions.push({
         date: profile.date,
@@ -364,9 +376,13 @@ export function buildWeeklyPlan(
         avgUv: 0,
         peakUv: profile.uvMax,
         reachedTarget: false,
+        skinDoseFraction: 0,
         withSunscreen: options.useSunscreen,
         recommendedSpf: spf,
-        note: "Nessuna finestra utile in giornata.",
+        note:
+          isToday && earliest > profile.sunriseMin
+            ? "La finestra utile di oggi è ormai passata: nuova sessione da domani."
+            : "Nessuna finestra utile in giornata.",
       });
       continue;
     }
@@ -374,12 +390,13 @@ export function buildWeeklyPlan(
     const { startMinute, session } = best;
     sessions.push({
       date: profile.date,
-      startTime: minutesToHHMM(startMinute),
-      endTime: minutesToHHMM(session.endMinute),
+      startTime: minuteToHHMM(startMinute),
+      endTime: minuteToHHMM(session.endMinute),
       durationMin: session.durationMin,
       avgUv: round1(session.avgUv),
       peakUv: round1(session.peakUv),
       reachedTarget: session.reachedTarget,
+      skinDoseFraction: Math.round((session.accumulatedDose / spfFactor / med) * 1000) / 1000,
       withSunscreen: options.useSunscreen,
       recommendedSpf: spf,
       note: session.reachedTarget
@@ -405,7 +422,8 @@ interface BestWindow {
 }
 
 /**
- * Sceglie la finestra di inizio migliore nella giornata.
+ * Sceglie la finestra di inizio migliore nella giornata, non prima di
+ * `earliestStart` (per il giorno corrente = adesso).
  * - "peak": minimizza la durata (ore più intense, esposizione efficiente).
  * - "gentle": predilige un UV medio moderato (sessione più lunga e graduale).
  */
@@ -413,11 +431,12 @@ function pickBestWindow(
   profile: DayUvProfile,
   targetDose: number,
   preference: "peak" | "gentle",
+  earliestStart: number,
 ): BestWindow | null {
   const STEP = 10;
   const candidates: BestWindow[] = [];
 
-  for (let start = profile.sunriseMin; start <= profile.sunsetMin; start += STEP) {
+  for (let start = earliestStart; start <= profile.sunsetMin; start += STEP) {
     const session = sessionFromStart(profile, start, targetDose);
     if (session.durationMin < 3) continue; // troppo breve per essere sensata
     candidates.push({ startMinute: start, session });
@@ -429,9 +448,14 @@ function pickBestWindow(
   if (reached.length === 0) {
     // Nessuna finestra raggiunge l'obiettivo del giorno (tipico con SPF alto o
     // UV basso): scegli la sessione che accumula più dose utile restando sicura.
-    return candidates.reduce((b, c) =>
+    const fallback = candidates.reduce((b, c) =>
       c.session.accumulatedDose > b.session.accumulatedDose ? c : b,
     );
+    // Se anche la migliore porta pochissima dose (< 15% dell'obiettivo, tipico
+    // di fine giornata), meglio dire che la finestra è passata che proporre
+    // una sessione inutile al tramonto.
+    if (fallback.session.accumulatedDose < targetDose * 0.15) return null;
+    return fallback;
   }
 
   if (preference === "peak") {
@@ -473,6 +497,20 @@ function round1(n: number): number {
 
 export type SessionSafety = "safe" | "aggressive" | "burn";
 
+/**
+ * Classificazione di sicurezza di una dose (frazione della MED).
+ * Unico punto di verità: usata dal motore e dalla UI (storico, pill, meter).
+ */
+export function classifySafety(
+  skinDoseFraction: number,
+  suggestedFraction: number = DEFAULT_SESSION_FRACTION,
+): SessionSafety {
+  if (skinDoseFraction >= 1.0) return "burn";
+  // piccola tolleranza: la sessione suggerita (≈ frazione esatta) resta "safe"
+  if (skinDoseFraction > suggestedFraction + 0.03) return "aggressive";
+  return "safe";
+}
+
 export interface SessionDose {
   /** dose ricevuta dalla pelle come frazione della MED del fototipo. */
   skinDoseFraction: number;
@@ -494,11 +532,6 @@ export interface SessionDoseOptions {
   useSunscreen: boolean;
   /** soglia "suggerita" oltre cui la sessione è considerata aggressiva. Default `DEFAULT_SESSION_FRACTION`. */
   suggestedFraction?: number;
-}
-
-function hhmmToMinute(t: string): number {
-  const m = t.match(/(\d{2}):(\d{2})/);
-  return m ? Number(m[1]) * 60 + Number(m[2]) : 0;
 }
 
 /**
@@ -543,9 +576,7 @@ export function computeSessionDose(
 
   const skinDoseFraction = ambientDose / spfFactor / med;
   const avgUv = ambientDose / (UVI_ERYTHEMAL_W_PER_M2 * 60 * durationMin);
-  // Piccola tolleranza: la sessione suggerita (≈ frazione esatta) resta "safe".
-  const safety: SessionSafety =
-    skinDoseFraction >= 1.0 ? "burn" : skinDoseFraction > suggested + 0.03 ? "aggressive" : "safe";
+  const safety = classifySafety(skinDoseFraction, suggested);
 
   return {
     skinDoseFraction: Math.round(skinDoseFraction * 1000) / 1000,
@@ -555,4 +586,27 @@ export function computeSessionDose(
     peakUv: round1(peakUv),
     safety,
   };
+}
+
+/**
+ * Quanti minuti servono, partendo da `startTime`, per raggiungere la frazione
+ * sicura della soglia (con o senza crema). Usata dal timer di sessione live per
+ * dire "fine sicura consigliata alle HH:MM". `reachedTarget` è false se la
+ * giornata finisce (o si supera il tetto di 2h) prima di arrivarci.
+ */
+export function safeDurationFrom(
+  forecast: Forecast,
+  phototype: Phototype,
+  date: string,
+  startTime: string,
+  options: SessionDoseOptions,
+): { durationMin: number; reachedTarget: boolean } {
+  const profile = buildDayProfiles(forecast).find((p) => p.date === date);
+  if (!profile) return { durationMin: 0, reachedTarget: false };
+  const med = MED_BY_PHOTOTYPE[phototype];
+  const suggested = options.suggestedFraction ?? DEFAULT_SESSION_FRACTION;
+  const spf = recommendedSpf(phototype, profile.uvMax);
+  const spfFactor = options.useSunscreen ? effectiveSpf(spf) : 1;
+  const session = sessionFromStart(profile, hhmmToMinute(startTime), suggested * med * spfFactor);
+  return { durationMin: session.durationMin, reachedTarget: session.reachedTarget };
 }

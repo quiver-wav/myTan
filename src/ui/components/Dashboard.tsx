@@ -2,14 +2,18 @@ import { useEffect, useMemo, useState } from "react";
 import {
   getForecast,
   buildWeeklyPlan,
-  computeSessionDose,
   projectRemaining,
   cumulativeTanByDate,
+  classifySafety,
+  nowInTimezone,
   getGoal,
   type Forecast,
+  type Phototype,
 } from "../../core/index";
 import { useStore } from "../store";
+import { tanToColor } from "../tanColor";
 import { ProgressChart } from "./ProgressChart";
+import { TodayCard } from "./TodayCard";
 
 const dateFmt = new Intl.DateTimeFormat("it-IT", {
   weekday: "short",
@@ -24,10 +28,12 @@ function addDays(iso: string, n: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-function safetyOf(fraction: number): "safe" | "aggressive" | "burn" {
-  if (fraction >= 1.0) return "burn";
-  if (fraction > 0.83) return "aggressive";
-  return "safe";
+/** Classe del badge UV in base all'intensità (scala OMS). */
+function uvClass(uv: number): string {
+  if (uv >= 8) return "extreme";
+  if (uv >= 6) return "high";
+  if (uv >= 3) return "mid";
+  return "low";
 }
 
 export function Dashboard() {
@@ -38,6 +44,21 @@ export function Dashboard() {
 
   const [forecast, setForecast] = useState<Forecast | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Tick al minuto: tiene aggiornati "adesso", la finestra di oggi e il timer.
+  const [minuteTick, setMinuteTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setMinuteTick((x) => x + 1), 60_000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Conferma in due tocchi per "Ricomincia" (cancella tutto).
+  const [confirmReset, setConfirmReset] = useState(false);
+  useEffect(() => {
+    if (!confirmReset) return;
+    const t = setTimeout(() => setConfirmReset(false), 4000);
+    return () => clearTimeout(t);
+  }, [confirmReset]);
 
   useEffect(() => {
     let active = true;
@@ -51,24 +72,33 @@ export function Dashboard() {
     };
   }, [location.latitude, location.longitude]);
 
-  const plan = useMemo(
-    () =>
-      forecast
-        ? buildWeeklyPlan(forecast, phototype, goalId, { useSunscreen: data.useSunscreen })
-        : null,
-    [forecast, phototype, goalId, data.useSunscreen],
-  );
+  const plan = useMemo(() => {
+    if (!forecast) return null;
+    return buildWeeklyPlan(forecast, phototype, goalId, {
+      useSunscreen: data.useSunscreen,
+      now: nowInTimezone(forecast.timezone),
+    });
+    // minuteTick tiene la finestra di oggi allineata all'ora corrente
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [forecast, phototype, goalId, data.useSunscreen, minuteTick]);
 
-  const projection = useMemo(
-    () =>
-      projectRemaining(phototype, goalId, data.history, {
-        sessionsPerWeek: data.sessionsPerWeek,
-      }),
-    [phototype, goalId, data.history, data.sessionsPerWeek],
-  );
+  const todayDate = forecast?.daily[0]?.date ?? "";
+
+  const projection = useMemo(() => {
+    // Nei giorni coperti dal forecast la proiezione usa la dose che il meteo
+    // permette davvero; oggi va escluso se la sessione è già registrata.
+    const upcomingDoses = plan?.sessions.map((s, i) => {
+      if (i === 0 && data.history.some((h) => h.date === s.date)) return null;
+      return s.durationMin > 0 ? s.skinDoseFraction : null;
+    });
+    return projectRemaining(phototype, goalId, data.history, {
+      sessionsPerWeek: data.sessionsPerWeek,
+      today: todayDate || undefined,
+      upcomingDoses,
+    });
+  }, [phototype, goalId, data.history, data.sessionsPerWeek, plan, todayDate]);
 
   const goal = getGoal(goalId);
-  const todayDate = forecast?.daily[0]?.date ?? "";
 
   const historyPoints = useMemo(
     () => cumulativeTanByDate(phototype, data.history),
@@ -92,8 +122,11 @@ export function Dashboard() {
         <div className="step-label" style={{ margin: 0 }}>
           {data.phototype?.label} · {location.name} · {goal.label}
         </div>
-        <button className="ghost" onClick={reset}>
-          Ricomincia
+        <button
+          className="ghost"
+          onClick={() => (confirmReset ? reset() : setConfirmReset(true))}
+        >
+          {confirmReset ? "Sicuro? Cancella tutto" : "Ricomincia"}
         </button>
       </div>
 
@@ -106,7 +139,12 @@ export function Dashboard() {
 
           <div className="card">
             <h2>Il tuo obiettivo: {goal.label}</h2>
-            <ProgressView projection={projection} />
+            <SkinPreview
+              phototype={phototype}
+              current={projection.currentTan}
+              target={projection.targetTan}
+            />
+            <ProgressView projection={projection} goalId={goalId} />
             <div style={{ marginTop: 10 }}>
               <ProgressChart
                 ceiling={projection.ceiling}
@@ -145,9 +183,20 @@ export function Dashboard() {
                 <div className="day" key={s.date}>
                   <span className="when" style={{ textTransform: "capitalize" }}>
                     {formatDate(s.date)}
+                    {(s.startTime || s.durationMin) && (
+                      <>
+                        <br />
+                        <span className="uv" style={{ textTransform: "none" }}>
+                          {s.startTime ?? ""}
+                          {s.startTime && s.durationMin ? " · " : ""}
+                          {s.durationMin ? `${s.durationMin} min` : ""}
+                          {s.withSunscreen ? " · SPF" : ""}
+                        </span>
+                      </>
+                    )}
                   </span>
                   <span>
-                    <span className={`pill ${safetyOf(s.skinDoseFraction)}`}>
+                    <span className={`pill ${classifySafety(s.skinDoseFraction)}`}>
                       {Math.round(s.skinDoseFraction * 100)}% soglia
                     </span>
                     <button
@@ -175,19 +224,29 @@ export function Dashboard() {
                   <span style={{ textAlign: "right" }}>
                     {s.startTime}–{s.endTime} · <b>{s.durationMin} min</b>
                     <br />
-                    <span className="uv">UV medio {s.avgUv} · SPF {s.recommendedSpf}</span>
+                    <span className="uv">
+                      <span className={`uvchip ${uvClass(s.avgUv)}`}>UV {s.avgUv}</span>
+                      {" "}SPF {s.recommendedSpf}
+                    </span>
                   </span>
                 ) : (
-                  <span className="uv">UV troppo basso</span>
+                  <span className="uv" style={{ textAlign: "right", maxWidth: "55%" }}>
+                    {s.note ?? "Giornata non utile"}
+                  </span>
                 )}
               </div>
             ))}
             <p className="note">{plan.summary}</p>
           </div>
 
-          <button className="ghost block" onClick={() => update({ goalId: null })}>
-            Cambia obiettivo
-          </button>
+          <div className="row">
+            <button className="ghost block" onClick={() => update({ goalId: null })}>
+              Cambia obiettivo
+            </button>
+            <button className="ghost block" onClick={() => update({ location: null })}>
+              Cambia località
+            </button>
+          </div>
         </>
       )}
 
@@ -200,114 +259,47 @@ export function Dashboard() {
   );
 }
 
-function TodayCard({ forecast, plan }: { forecast: Forecast; plan: ReturnType<typeof buildWeeklyPlan> }) {
-  const { data, update, logSession } = useStore();
-  const today = plan.sessions[0];
-  const usable = !!today && today.durationMin > 0;
-
-  const [duration, setDuration] = useState(today?.durationMin ?? 0);
-  useEffect(() => {
-    setDuration(today?.durationMin ?? 0);
-  }, [today?.durationMin, today?.startTime, data.useSunscreen]);
-
-  const dose = useMemo(() => {
-    if (!usable || !today) return null;
-    return computeSessionDose(forecast, data.phototype!.phototype, today.date, today.startTime, duration, {
-      useSunscreen: data.useSunscreen,
-    });
-  }, [usable, today, duration, data.useSunscreen, data.phototype, forecast]);
-
-  const alreadyLogged = !!today && data.history.some((s) => s.date === today.date);
-
-  const safetyText = {
-    safe: "Sicura — entro la soglia consigliata",
-    aggressive: "Oltre il consigliato, ma sotto la scottatura",
-    burn: "Rischio scottatura: stai superando la tua soglia",
-  };
-
+/**
+ * Anteprima del colore della pelle: dove sei oggi → dove stai andando.
+ * Traduce il livello di abbronzatura del modello in tonalità reali.
+ */
+function SkinPreview({
+  phototype,
+  current,
+  target,
+}: {
+  phototype: Phototype;
+  current: number;
+  target: number;
+}) {
+  const from = tanToColor(phototype, current);
+  const to = tanToColor(phototype, target);
   return (
-    <div className="card">
-      <div className="row">
-        <h2 style={{ margin: 0 }}>Oggi</h2>
-        <label className="toggle">
-          <input
-            type="checkbox"
-            checked={data.useSunscreen}
-            onChange={(e) => update({ useSunscreen: e.target.checked })}
-          />
-          Userò la protezione
-        </label>
+    <div className="skin-preview">
+      <div className="swatch-wrap">
+        <span className="swatch" style={{ background: from }} />
+        <span className="lbl">Oggi</span>
       </div>
-
-      {!usable && (
-        <p className="muted" style={{ marginTop: 12 }}>
-          Oggi l'UV è troppo basso per un'esposizione utile. Riprova in una giornata
-          più soleggiata.
-        </p>
-      )}
-
-      {usable && today && dose && (
-        <>
-          <p className="muted" style={{ marginTop: 10, marginBottom: 4 }}>
-            Finestra suggerita: <b>{today.startTime}</b> · durata consigliata{" "}
-            <b>{today.durationMin} min</b> (SPF {today.recommendedSpf})
-          </p>
-
-          <div className="row" style={{ marginTop: 14 }}>
-            <span className="muted" style={{ fontSize: 13 }}>La tua durata</span>
-            <span className="big" style={{ fontSize: 22 }}>{duration} min</span>
-          </div>
-          <input
-            type="range"
-            min={0}
-            max={120}
-            value={duration}
-            onChange={(e) => setDuration(Number(e.target.value))}
-          />
-
-          <div className="dose-meter">
-            <div
-              className="marker"
-              style={{ left: `${Math.min(dose.skinDoseFraction / 1.25, 1) * 100}%` }}
-            />
-          </div>
-          <div className="scale">
-            <span>0</span>
-            <span>soglia sicura</span>
-            <span>scottatura</span>
-          </div>
-
-          <div className="row" style={{ marginTop: 12 }}>
-            <span className={`pill ${dose.safety}`}>
-              {Math.round(dose.skinDoseFraction * 100)}% della soglia
-            </span>
-            <span style={{ fontSize: 13, textAlign: "right", maxWidth: "60%" }}>
-              {safetyText[dose.safety]}
-            </span>
-          </div>
-
-          {today.note && <p className="note">{today.note}</p>}
-
-          <button
-            className="block"
-            style={{ marginTop: 14 }}
-            onClick={() =>
-              logSession({ date: today.date, skinDoseFraction: dose.skinDoseFraction })
-            }
-          >
-            {alreadyLogged ? "Aggiorna sessione di oggi ✓" : "Registra sessione di oggi"}
-          </button>
-        </>
-      )}
+      <div className="skin-grad" style={{ background: `linear-gradient(90deg, ${from}, ${to})` }} />
+      <div className="swatch-wrap">
+        <span className="swatch" style={{ background: to }} />
+        <span className="lbl">Obiettivo</span>
+      </div>
     </div>
   );
 }
 
-function ProgressView({ projection }: { projection: ReturnType<typeof projectRemaining> }) {
+function ProgressView({
+  projection,
+  goalId,
+}: {
+  projection: ReturnType<typeof projectRemaining>;
+  goalId: string;
+}) {
   const pctOfCeiling = projection.ceiling > 0 ? projection.currentTan / projection.ceiling : 0;
   const targetPct = projection.ceiling > 0 ? projection.targetTan / projection.ceiling : 0;
 
-  return (
+  const bar = (
     <>
       <div className="bar" style={{ position: "relative" }}>
         <span style={{ width: `${Math.min(pctOfCeiling, 1) * 100}%` }} />
@@ -317,8 +309,9 @@ function ProgressView({ projection }: { projection: ReturnType<typeof projectRem
             top: -3,
             left: `${Math.min(targetPct, 1) * 100}%`,
             width: 3,
-            height: 18,
-            background: "#3a2e1f",
+            height: 16,
+            borderRadius: 2,
+            background: "var(--ink)",
           }}
           title="obiettivo"
         />
@@ -327,9 +320,50 @@ function ProgressView({ projection }: { projection: ReturnType<typeof projectRem
         Abbronzatura attuale {Math.round(pctOfCeiling * 100)}% · l'asticella scura è il
         tuo obiettivo.
       </p>
+    </>
+  );
+
+  // "Mantenimento": l'obiettivo è tenere il livello attuale, non crescere.
+  if (goalId === "mantenimento") {
+    if (projection.currentTan < 0.03) {
+      return (
+        <>
+          {bar}
+          <p className="muted" style={{ marginTop: 8 }}>
+            Non hai ancora un'abbronzatura da mantenere: registra le tue sessioni, o
+            scegli un obiettivo di crescita.
+          </p>
+        </>
+      );
+    }
+    const horizon = Math.min(27, projection.curve.length - 1);
+    const inAMonth = projection.curve[horizon]?.tan ?? projection.currentTan;
+    const keptPct = Math.round((inAMonth / projection.currentTan) * 100);
+    return (
+      <>
+        {bar}
+        <div style={{ marginTop: 8 }}>
+          {keptPct >= 95 ? (
+            <span className="muted">
+              Questo ritmo mantiene la tua abbronzatura (≈{keptPct}% tra un mese).
+            </span>
+          ) : (
+            <span className="muted">
+              A questo ritmo tra un mese ne conserveresti solo ~{keptPct}%: aumenta le
+              sessioni a settimana.
+            </span>
+          )}
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <>
+      {bar}
       <div style={{ marginTop: 8 }}>
         {projection.reachedGoal && projection.daysNeeded === 0 ? (
-          <span className="big">Obiettivo raggiunto! 🎉</span>
+          <span className="big">Obiettivo raggiunto!</span>
         ) : projection.reachedGoal ? (
           <>
             <span className="big">~{projection.daysNeeded} giorni</span>
